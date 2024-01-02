@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/go-faster/errors"
+	"github.com/gotd/td/telegram"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
@@ -15,11 +17,24 @@ import (
 	"github.com/iyear/tdl/pkg/consts"
 	"github.com/iyear/tdl/pkg/kv"
 	"github.com/iyear/tdl/pkg/logger"
+	"github.com/iyear/tdl/pkg/tclient"
+	"github.com/iyear/tdl/pkg/utils"
+)
+
+var (
+	defaultBoltPath = filepath.Join(consts.DataDir, "data")
+
+	DefaultLegacyStorage = map[string]string{
+		kv.DriverTypeKey: kv.DriverLegacy.String(),
+		"path":           filepath.Join(consts.DataDir, "data.kv"),
+	}
+	DefaultBoltStorage = map[string]string{
+		kv.DriverTypeKey: kv.DriverBolt.String(),
+		"path":           defaultBoltPath,
+	}
 )
 
 func New() *cobra.Command {
-	driverTypeKey := "type"
-
 	cmd := &cobra.Command{
 		Use:           "tdl",
 		Short:         "Telegram Downloader, but more than a downloader",
@@ -40,19 +55,14 @@ func New() *cobra.Command {
 					zap.String("namespace", ns))
 			}
 
-			// check storage flag
-			storageOpts := viper.GetStringMapString(consts.FlagStorage)
-			driver, err := kv.ParseDriver(storageOpts[driverTypeKey])
-			if err != nil {
-				return errors.Wrap(err, "parse driver")
+			// v0.14.0: default storage changed from legacy to bolt, so we need to auto migrate to keep compatibility
+			if !cmd.Flags().Lookup(consts.FlagStorage).Changed && !utils.FS.PathExists(defaultBoltPath) {
+				if err := migrateLegacyToBolt(); err != nil {
+					return errors.Wrap(err, "migrate legacy to bolt")
+				}
 			}
-			delete(storageOpts, driverTypeKey)
 
-			opts := make(map[string]any)
-			for k, v := range storageOpts {
-				opts[k] = v
-			}
-			storage, err := kv.New(driver, opts)
+			storage, err := kv.NewWithMap(viper.GetStringMapString(consts.FlagStorage))
 			if err != nil {
 				return errors.Wrap(err, "create kv storage")
 			}
@@ -69,16 +79,15 @@ func New() *cobra.Command {
 	}
 
 	cmd.AddCommand(NewVersion(), NewLogin(), NewDownload(), NewForward(),
-		NewChat(), NewUpload(), NewBackup(), NewRecover(), NewGen())
+		NewChat(), NewUpload(), NewBackup(), NewRecover(), NewMigrate(), NewGen())
 
-	cmd.PersistentFlags().StringToString(consts.FlagStorage, map[string]string{
-		driverTypeKey: kv.DriverLegacy.String(),
-		"path":        consts.KVPath,
-	}, fmt.Sprintf("storage options, format: type=driver,key1=value1,key2=value2. Available drivers: [%s]",
-		strings.Join(kv.DriverNames(), ",")))
+	cmd.PersistentFlags().StringToString(consts.FlagStorage,
+		DefaultBoltStorage,
+		fmt.Sprintf("storage options, format: type=driver,key1=value1,key2=value2. Available drivers: [%s]",
+			strings.Join(kv.DriverNames(), ",")))
 
 	cmd.PersistentFlags().String(consts.FlagProxy, "", "proxy address, format: protocol://username:password@host:port")
-	cmd.PersistentFlags().StringP(consts.FlagNamespace, "n", "", "namespace for Telegram session")
+	cmd.PersistentFlags().StringP(consts.FlagNamespace, "n", "default", "namespace for Telegram session")
 	cmd.PersistentFlags().Bool(consts.FlagDebug, false, "enable debug mode")
 
 	cmd.PersistentFlags().IntP(consts.FlagPartSize, "s", 512*1024, "part size for transfer, max is 512*1024")
@@ -125,4 +134,50 @@ func completeExtFiles(ext ...string) completeFunc {
 
 		return files, cobra.ShellCompDirectiveFilterDirs
 	}
+}
+
+func tRun(ctx context.Context, f func(ctx context.Context, c *telegram.Client, kvd kv.KV) error, middlewares ...telegram.Middleware) error {
+	// init tclient kv
+	kvd, err := kv.From(ctx).Open(viper.GetString(consts.FlagNamespace))
+	if err != nil {
+		return errors.Wrap(err, "open kv storage")
+	}
+	o := tclient.Options{
+		KV:               kvd,
+		Proxy:            viper.GetString(consts.FlagProxy),
+		NTP:              viper.GetString(consts.FlagNTP),
+		ReconnectTimeout: viper.GetDuration(consts.FlagReconnectTimeout),
+		Test:             viper.GetString(consts.FlagTest) != "",
+		UpdateHandler:    nil,
+	}
+
+	client, err := tclient.New(ctx, o, false, middlewares...)
+	if err != nil {
+		return errors.Wrap(err, "create client")
+	}
+
+	return tclient.Run(ctx, client, func(ctx context.Context) error {
+		return f(ctx, client, kvd)
+	})
+}
+
+func migrateLegacyToBolt() (rerr error) {
+	legacy, err := kv.NewWithMap(DefaultLegacyStorage)
+	if err != nil {
+		return errors.Wrap(err, "create legacy kv storage")
+	}
+	defer multierr.AppendInvoke(&rerr, multierr.Close(legacy))
+
+	bolt, err := kv.NewWithMap(DefaultBoltStorage)
+	if err != nil {
+		return errors.Wrap(err, "create bolt kv storage")
+	}
+	defer multierr.AppendInvoke(&rerr, multierr.Close(bolt))
+
+	meta, err := legacy.MigrateTo()
+	if err != nil {
+		return errors.Wrap(err, "migrate legacy to bolt")
+	}
+
+	return bolt.MigrateFrom(meta)
 }
